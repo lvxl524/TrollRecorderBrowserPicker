@@ -17,7 +17,7 @@
 #import <objc/message.h>
 
 // ===== Version =====
-#define TRP_VERSION @"1.0.0"
+#define TRP_VERSION @"1.0.1"
 
 // ===== Preferences =====
 #define PREFS_PATH @"/var/mobile/Library/Preferences/com.mosheng.trappbrowserpicker.plist"
@@ -72,6 +72,16 @@ static BOOL s_bypassHook = NO;
 // handles the callback itself; our swizzle must NOT call the handler again, or
 // the session throws WebAuthenticationSession error 2.
 static BOOL s_externalFlow = NO;
+
+// App's own registered URL scheme (read from TrollRecorder's Info.plist at load).
+// Used so external-browser callbacks can be redirected back INTO TrollRecorder
+// instead of to the scheme the auth server expects (e.g. sileo://, which would
+// open Sileo). nil if the app registers no scheme.
+static NSString *g_appScheme = nil;
+// The original scheme TrollRecorder passed to ASWebAuthenticationSession (e.g. sileo).
+// Its completion handler expects a callback URL carrying this scheme, so we rewrite
+// the app-scheme callback back to this one before delivering.
+static NSString *s_origScheme = nil;
 
 // ===== Helpers =====
 
@@ -146,6 +156,49 @@ static void openInBrowser(NSURL *authURL, NSInteger mode) {
     }
 }
 
+// Read TrollRecorder's own registered URL scheme from its Info.plist.
+// The tweak is injected into TrollRecorder, so [NSBundle mainBundle] is TrollRecorder.
+static void trpLoadAppScheme(void) {
+    NSBundle *b = [NSBundle mainBundle];
+    NSArray *types = b.infoDictionary[@"CFBundleURLTypes"];
+    for (NSDictionary *t in types) {
+        NSArray *schemes = t[@"CFBundleURLSchemes"];
+        for (NSString *s in schemes) {
+            if (s.length) { g_appScheme = [s copy]; return; }
+        }
+    }
+}
+
+// Rewrite every occurrence of `<from>://` (and its percent-encoded form) in a URL
+// string to `<to>://`. Used to retarget the auth callback from the server-expected
+// scheme (sileo://) to TrollRecorder's own scheme so external browsers hand the
+// callback back to TrollRecorder.
+static NSURL *trpRewriteScheme(NSURL *url, NSString *from, NSString *to) {
+    if (!from.length || !to.length) return url;
+    NSString *s = url.absoluteString;
+    NSString *fromDec = [NSString stringWithFormat:@"%@://", from];
+    NSString *fromEnc = [NSString stringWithFormat:@"%@%%3A%%2F%%2F", from];
+    NSString *toDec = [NSString stringWithFormat:@"%@://", to];
+    NSString *toEnc = [NSString stringWithFormat:@"%@%%3A%%2F%%2F", to];
+    s = [s stringByReplacingOccurrencesOfString:fromDec withString:toDec
+                                      options:NSCaseInsensitiveSearch range:NSMakeRange(0, s.length)];
+    s = [s stringByReplacingOccurrencesOfString:fromEnc withString:toEnc
+                                      options:NSCaseInsensitiveSearch range:NSMakeRange(0, s.length)];
+    return [NSURL URLWithString:s] ?: url;
+}
+
+// Open the auth URL in a third-party browser, retargeting the callback to
+// TrollRecorder's own scheme (when available) so the callback returns here.
+static void openExternal(NSURL *authURL, NSInteger mode) {
+    if (g_appScheme && g_appScheme.length && s_origScheme && s_origScheme.length) {
+        s_pendingScheme = [g_appScheme copy];
+        NSURL *modified = trpRewriteScheme(authURL, s_origScheme, g_appScheme);
+        openInBrowser(modified, mode);
+    } else {
+        openInBrowser(authURL, mode);
+    }
+}
+
 // Get the active window (iOS 13+ UIScene compatible)
 static UIWindow *trpActiveWindow(void) {
     for (UIScene *scene in [UIApplication.sharedApplication connectedScenes]) {
@@ -194,19 +247,19 @@ static void showBrowserPicker(NSURL *authURL) {
         [alert addAction:[UIAlertAction actionWithTitle:@"Alook"
                                                    style:UIAlertActionStyleDefault
                                                  handler:^(UIAlertAction *a) {
-            openInBrowser(authURL, TRP_ALOOK);
+            openExternal(authURL, TRP_ALOOK);
         }]];
 
         [alert addAction:[UIAlertAction actionWithTitle:@"Chrome"
                                                    style:UIAlertActionStyleDefault
                                                  handler:^(UIAlertAction *a) {
-            openInBrowser(authURL, TRP_CHROME);
+            openExternal(authURL, TRP_CHROME);
         }]];
 
         [alert addAction:[UIAlertAction actionWithTitle:@"夸克"
                                                    style:UIAlertActionStyleDefault
                                                  handler:^(UIAlertAction *a) {
-            openInBrowser(authURL, TRP_QUARK);
+            openExternal(authURL, TRP_QUARK);
         }]];
 
         [alert addAction:[UIAlertAction actionWithTitle:@"Safari (默认)"
@@ -286,10 +339,25 @@ static BOOL swizzled_openURL_impl(id self, SEL _cmd,
         [url.scheme caseInsensitiveCompare:s_pendingScheme] == NSOrderedSame) {
         // Capture the handler before cleanup
         void (^handler)(NSURL *, NSError *) = s_pendingHandler;
+
+        // The callback arrived via TrollRecorder's own scheme (g_appScheme). The
+        // completion handler expects the ORIGINAL scheme TrollRecorder passed to
+        // ASWebAuthenticationSession (e.g. sileo://), so rewrite the scheme back
+        // before delivering — the rest of the URL (token, etc.) is untouched.
+        NSURL *deliverURL = url;
+        if (s_origScheme && s_origScheme.length &&
+            [url.scheme caseInsensitiveCompare:s_origScheme] != NSOrderedSame) {
+            NSString *s = url.absoluteString;
+            NSString *cur = [NSString stringWithFormat:@"%@://", url.scheme];
+            NSString *orig = [NSString stringWithFormat:@"%@://", s_origScheme];
+            s = [s stringByReplacingOccurrencesOfString:cur withString:orig
+                                             options:NSCaseInsensitiveSearch range:NSMakeRange(0, s.length)];
+            deliverURL = [NSURL URLWithString:s] ?: url;
+        }
         cleanupPending();
 
-        // Call the stored completion handler with the callback URL
-        handler(url, nil);
+        // Call the stored completion handler with the (scheme-restored) callback URL
+        handler(deliverURL, nil);
         return YES;
     }
 
@@ -318,6 +386,7 @@ static BOOL swizzled_openURL_impl(id self, SEL _cmd,
         // what scheme TrollRecorder uses.
         s_pendingURL     = [url copy];
         s_pendingScheme  = [scheme copy];
+        s_origScheme     = [scheme copy];
         s_pendingHandler = [handler copy];
         s_pendingSession = ret;
         s_hasPending     = YES;
@@ -356,15 +425,27 @@ static BOOL swizzled_openURL_impl(id self, SEL _cmd,
         case TRP_ALOOK:
         case TRP_CHROME:
         case TRP_QUARK:
-            // Redirect to external browser — we must deliver callback ourselves
-            s_externalFlow = YES;
-            openInBrowser(s_pendingURL, mode);
-            setupAutoCancel();
-            return YES;  // Pretend session started
+            // Redirect to an external browser. TrollRecorder's auth callback scheme
+            // is owned by another app (e.g. sileo://), so a real browser would hand
+            // the callback to that app instead of TrollRecorder. When TrollRecorder
+            // registers its own scheme we retarget the callback to it (openExternal),
+            // so the result comes back here. If it registers no scheme, an external
+            // browser cannot deliver the callback — fall back to an ephemeral Safari
+            // session (isolated cookies, returns in-process to TrollRecorder).
+            if (g_appScheme && g_appScheme.length) {
+                s_externalFlow = YES;
+                openExternal(s_pendingURL, mode);
+                setupAutoCancel();
+                return YES;  // Pretend session started
+            }
+            s_externalFlow = NO;
+            self.prefersEphemeralWebBrowserSession = YES;
+            return %orig;
 
         case TRP_ASK:
             // Show picker — callback will be delivered either by us (external
-            // browser chosen) or by a new native session (Safari modes).
+            // browser chosen, retargeted to TrollRecorder's scheme) or by a new
+            // native session (Safari modes).
             s_externalFlow = YES;
             showBrowserPicker(s_pendingURL);
             setupAutoCancel();
@@ -415,8 +496,9 @@ static BOOL swizzled_openURL_impl(id self, SEL _cmd,
 
 // ===== Constructor =====
 %ctor {
+    trpLoadAppScheme();
     %init(ASWebAuthHooks);
     %init(AppDelegateHooks);
 
-    NSLog(@"[TrollRecorderBrowserPicker] v%@ loaded", TRP_VERSION);
+    NSLog(@"[TrollRecorderBrowserPicker] v%@ loaded (appScheme=%@)", TRP_VERSION, g_appScheme);
 }

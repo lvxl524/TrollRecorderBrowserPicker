@@ -72,7 +72,7 @@ Safari(独立会话) = 隔离 Cookie，不影响 Safari 登录状态
 			<key>label</key>
 			<string>关于</string>
 		<key>footerText</key>
-		<string>TrollRecorderBrowserPicker v1.0.0
+		<string>TrollRecorderBrowserPicker v1.0.1
 拦截巨魔录音机登录的 ASWebAuthenticationSession，可选择不同浏览器打开登录页面。
 
 支持: Alook / Chrome / 夸克 / Safari / Safari(独立会话)
