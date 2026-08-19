@@ -1,0 +1,140 @@
+name: Build TrollRecorderBrowserPicker deb
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify source version
+        id: version
+        run: |
+          echo "=== control file ==="
+          cat layout/DEBIAN/control
+          VERSION=$(grep '^Version:' layout/DEBIAN/control | awk '{print $2}')
+          echo "CONTROL_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Version from source: $VERSION"
+
+      - name: Install Theos dependencies
+        run: |
+          brew install ldid make dpkg || true
+          brew unlink ldid && brew link ldid || true
+
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: /Users/runner/theos
+          key: theos-macos-${{ runner.os }}-v2
+
+      - name: Install Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          export THEOS=/Users/runner/theos
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          mkdir -p $THEOS/sdks
+
+      - name: Set THEOS env
+        run: |
+          echo "THEOS=/Users/runner/theos" >> $GITHUB_ENV
+          echo "/Users/runner/theos/bin" >> $GITHUB_PATH
+
+      - name: Fetch patched SDK
+        run: |
+          THEOS=/Users/runner/theos
+          if [ ! -d "$THEOS/sdks/iPhoneOS.sdk" ]; then
+            git clone --depth 1 https://github.com/theos/sdks /tmp/sbp-sdks || true
+            cp -R /tmp/sbp-sdks/* $THEOS/sdks/ 2>/dev/null || true
+          fi
+          ls $THEOS/sdks/
+
+      - name: Fallback SDK
+        run: |
+          THEOS=/Users/runner/theos
+          if [ ! -d "$THEOS/sdks/iPhoneOS.sdk" ]; then
+            SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+            ln -s "$SDK_PATH" "$THEOS/sdks/iPhoneOS.sdk"
+          fi
+
+      - name: Fix permissions
+        run: |
+          chmod 755 layout/DEBIAN/postinst layout/DEBIAN/prerm 2>/dev/null || true
+
+      - name: Full clean
+        run: |
+          make clean 2>/dev/null || true
+          rm -rf .theos .theos-obj obj packages
+          echo "Cleaned"
+
+      - name: Build with explicit version override
+        run: |
+          echo "=== Building version: $CONTROL_VERSION ==="
+          mkdir -p layout/DEBIAN
+          cat > layout/DEBIAN/control << CTRLFILE
+          Package: com.mosheng.trappbrowserpicker
+          Name: 巨魔录音机 浏览器选择
+          Version: ${CONTROL_VERSION}
+          Architecture: iphoneos-arm64e
+          Description: Choose which browser opens for TrollRecorder login (ASWebAuthenticationSession).
+          Maintainer: mosheng
+          Author: mosheng
+          Section: Tweaks
+          CTRLFILE
+          echo "--- control after rewrite ---"
+          cat layout/DEBIAN/control
+          make package FINALPACKAGE=1 THEOS_PACKAGE_ARCH=iphoneos-arm64e
+
+      - name: Repack with gzip (Sileo cannot extract lzma)
+        run: |
+          set -e
+          DEB=$(ls packages/*.deb | head -n1)
+          echo "Repacking $DEB with gzip compression"
+          rm -rf /tmp/sbp_repack
+          mkdir -p /tmp/sbp_repack
+          dpkg-deb -x "$DEB" /tmp/sbp_repack/
+          dpkg-deb -e "$DEB" /tmp/sbp_repack/DEBIAN
+          rm -f packages/*.deb
+          mkdir -p packages
+          dpkg-deb -Zgzip -b /tmp/sbp_repack "packages/$(basename "$DEB")"
+          echo "=== repacked ==="
+          ls -la packages/
+          dpkg-deb -I packages/*.deb | grep -E '^( Package:| Version:| Architecture:| Depends:)'
+
+      - name: Verify built deb
+        run: |
+          echo "=== Generated packages ==="
+          ls -la packages/ 2>/dev/null || echo "No packages dir"
+          find . -name "*.deb" -type f | while read deb; do
+            echo "=== Deb: $deb ==="
+            echo "Filename: $(basename $deb)"
+            dpkg-deb -I "$deb" | grep -E '^( Package:| Version:| Architecture:)'
+            echo ""
+          done
+
+      - name: Check version match
+        run: |
+          EXPECTED="$CONTROL_VERSION"
+          find . -name "*.deb" -type f | while read deb; do
+            ACTUAL=$(dpkg-deb -I "$deb" | grep '^ Version:' | awk '{print $2}')
+            echo "Expected: $EXPECTED, Actual: $ACTUAL, File: $deb"
+            if [ "$ACTUAL" != "$EXPECTED" ]; then
+              echo "ERROR: Version mismatch!"
+              exit 1
+            fi
+          done
+          echo "=== VERSION CHECK PASSED ==="
+
+      - name: Upload deb artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrollRecorderBrowserPicker-deb
+          path: packages/*.deb
+          retention-days: 30
+          if-no-files-found: error

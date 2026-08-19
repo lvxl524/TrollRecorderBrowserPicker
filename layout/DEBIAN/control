@@ -1,0 +1,8 @@
+Package: com.mosheng.trappbrowserpicker
+Name: 巨魔录音机 浏览器选择
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Choose which browser opens for TrollRecorder login (ASWebAuthenticationSession).
+Maintainer: mosheng
+Author: mosheng
+Section: Tweaks

@@ -1,0 +1,3 @@
+#!/bin/bash
+killall -9 TrollRecorder 2>/dev/null || true
+exit 0
