@@ -17,7 +17,7 @@
 #import <objc/message.h>
 
 // ===== Version =====
-#define TRP_VERSION @"1.0.1"
+#define TRP_VERSION @"1.0.2"
 
 // ===== Preferences =====
 #define PREFS_PATH @"/var/mobile/Library/Preferences/com.mosheng.trappbrowserpicker.plist"
@@ -236,6 +236,61 @@ static void trpPresent(UIAlertController *alert) {
     [vc presentViewController:alert animated:YES completion:nil];
 }
 
+// ===== External-browser feasibility & fallback =====
+
+// Whether a REAL third-party browser can deliver the ASWebAuthenticationSession
+// callback back to TrollRecorder. This is ONLY possible when the callback scheme
+// the app passed to ASWebAuthenticationSession (s_origScheme) is one that
+// TrollRecorder itself registered. If the callback scheme belongs to a DIFFERENT
+// app (e.g. sileo://, because TrollRecorder's auth rides on Sileo's service), a
+// real browser will hand the sileo:// redirect to Sileo, never to TrollRecorder —
+// so external browsers can never complete the login and we must fall back to an
+// in-process Safari (ephemeral) session.
+static BOOL trpExternalCanReturn(void) {
+    if (!s_origScheme.length) return NO;
+    if (g_appScheme && [s_origScheme caseInsensitiveCompare:g_appScheme] == NSOrderedSame) {
+        return YES;
+    }
+    NSBundle *b = [NSBundle mainBundle];
+    NSArray *types = b.infoDictionary[@"CFBundleURLTypes"];
+    for (NSDictionary *t in types) {
+        for (NSString *s in t[@"CFBundleURLSchemes"]) {
+            if (s.length && [s caseInsensitiveCompare:s_origScheme] == NSOrderedSame) {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+// Start TrollRecorder's ORIGINAL session with an ephemeral (cookie-isolated)
+// Safari session. The callback is captured in-process and delivered back to
+// TrollRecorder, so it always returns here (used as the fallback for when an
+// external browser cannot carry the callback home).
+static void trpStartNativeEphemeral(void) {
+    if (s_hasPending && s_pendingSession && s_pendingHandler) {
+        s_bypassHook = YES;
+        s_pendingSession.prefersEphemeralWebBrowserSession = YES;
+        [s_pendingSession start];
+        s_bypassHook = NO;
+        cleanupPending();
+    }
+}
+
+// Explain to the user why the external browser choice was redirected.
+static void trpExplainExternalFallback(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:@"已改用 Safari 独立会话"
+                             message:@"该登录的回调 scheme 是 sileo://（属于 Sileo App）。第三方浏览器打开登录页后，会把 sileo:// 回调交给 Sileo 而非巨魔录音机，因此无法用 Alook / Chrome / 夸克 完成登录。已自动改用 Safari 独立会话（隔离 Cookie、不共享 Safari 登录态），登录仍会返回巨魔录音机。"
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                                   style:UIAlertActionStyleDefault
+                                                 handler:nil]];
+        trpPresent(alert);
+    });
+}
+
 // Show browser picker action sheet
 static void showBrowserPicker(NSURL *authURL) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -247,19 +302,34 @@ static void showBrowserPicker(NSURL *authURL) {
         [alert addAction:[UIAlertAction actionWithTitle:@"Alook"
                                                    style:UIAlertActionStyleDefault
                                                  handler:^(UIAlertAction *a) {
-            openExternal(authURL, TRP_ALOOK);
+            if (trpExternalCanReturn()) {
+                openExternal(authURL, TRP_ALOOK);
+            } else {
+                trpExplainExternalFallback();
+                trpStartNativeEphemeral();
+            }
         }]];
 
         [alert addAction:[UIAlertAction actionWithTitle:@"Chrome"
                                                    style:UIAlertActionStyleDefault
                                                  handler:^(UIAlertAction *a) {
-            openExternal(authURL, TRP_CHROME);
+            if (trpExternalCanReturn()) {
+                openExternal(authURL, TRP_CHROME);
+            } else {
+                trpExplainExternalFallback();
+                trpStartNativeEphemeral();
+            }
         }]];
 
         [alert addAction:[UIAlertAction actionWithTitle:@"夸克"
                                                    style:UIAlertActionStyleDefault
                                                  handler:^(UIAlertAction *a) {
-            openExternal(authURL, TRP_QUARK);
+            if (trpExternalCanReturn()) {
+                openExternal(authURL, TRP_QUARK);
+            } else {
+                trpExplainExternalFallback();
+                trpStartNativeEphemeral();
+            }
         }]];
 
         [alert addAction:[UIAlertAction actionWithTitle:@"Safari (默认)"
@@ -425,19 +495,20 @@ static BOOL swizzled_openURL_impl(id self, SEL _cmd,
         case TRP_ALOOK:
         case TRP_CHROME:
         case TRP_QUARK:
-            // Redirect to an external browser. TrollRecorder's auth callback scheme
-            // is owned by another app (e.g. sileo://), so a real browser would hand
-            // the callback to that app instead of TrollRecorder. When TrollRecorder
-            // registers its own scheme we retarget the callback to it (openExternal),
-            // so the result comes back here. If it registers no scheme, an external
-            // browser cannot deliver the callback — fall back to an ephemeral Safari
-            // session (isolated cookies, returns in-process to TrollRecorder).
-            if (g_appScheme && g_appScheme.length) {
+            // Redirect to an external browser ONLY when the callback scheme is one
+            // TrollRecorder owns (e.g. Sileo's own login, where sileo:// is owned by
+            // Sileo). For TrollRecorder the callback scheme is sileo:// but owned by
+            // Sileo, so a real browser would hand the sileo:// redirect to Sileo and
+            // the login could never return here. In that case fall back to an in-process
+            // Safari (ephemeral) session, which captures the sileo:// callback internally
+            // and delivers it back to TrollRecorder. An explanatory alert is shown.
+            if (trpExternalCanReturn()) {
                 s_externalFlow = YES;
                 openExternal(s_pendingURL, mode);
                 setupAutoCancel();
                 return YES;  // Pretend session started
             }
+            trpExplainExternalFallback();
             s_externalFlow = NO;
             self.prefersEphemeralWebBrowserSession = YES;
             return %orig;
