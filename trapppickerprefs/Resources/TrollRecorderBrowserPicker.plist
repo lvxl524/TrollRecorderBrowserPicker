@@ -8,7 +8,7 @@
 			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>default</key>
-			<false/>
+			<true/>
 			<key>defaults</key>
 			<string>com.mosheng.trappbrowserpicker</string>
 			<key>key</key>
@@ -38,7 +38,7 @@ Safari(独立会话) = 隔离 Cookie，可用于切换账号而不登出主 Safa
 			<key>detail</key>
 			<string>PSListItemsController</string>
 			<key>default</key>
-			<integer>0</integer>
+			<integer>6</integer>
 			<key>defaults</key>
 			<string>com.mosheng.trappbrowserpicker</string>
 			<key>key</key>
@@ -68,12 +68,14 @@ Safari(独立会话) = 隔离 Cookie，可用于切换账号而不登出主 Safa
 			<key>label</key>
 			<string>关于</string>
 		<key>footerText</key>
-		<string>TrollRecorderBrowserPicker v1.0.3
+		<string>TrollRecorderBrowserPicker v1.0.4
 拦截巨魔录音机登录的 ASWebAuthenticationSession，仅提供 Safari 两种会话选择。
+默认「启用」+「每次询问」：登录时弹出选择窗口。
 
 · Safari(默认)：共享 Cookie，等同官方原样
 · Safari(独立会话)：隔离 Cookie，用于切换账号
 说明：因回调 scheme 归 Sileo，第三方浏览器无法回传，故不支持。
+不想每次都弹窗，可在此关闭「启用插件」或把「浏览器」固定为某一项。
 作者: mosheng</string>
 		</dict>
 	</array>

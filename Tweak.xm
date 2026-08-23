@@ -27,7 +27,7 @@
 #import <objc/runtime.h>
 
 // ===== Version =====
-#define TRP_VERSION @"1.0.3"
+#define TRP_VERSION @"1.0.4"
 
 // ===== Preferences =====
 #define PREFS_PATH @"/var/mobile/Library/Preferences/com.mosheng.trappbrowserpicker.plist"
@@ -70,14 +70,16 @@ static id s_activeObserver = nil;
 
 static BOOL trpEnabled(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:PREFS_PATH];
+    if (!d) return YES;                  // no prefs yet → engage by default (show picker)
     NSNumber *en = d[kEnabled];
-    return en ? en.boolValue : NO;   // default OFF — zero interference until enabled
+    return en ? en.boolValue : YES;      // default ON
 }
 
 static NSInteger trpMode(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:PREFS_PATH];
+    if (!d) return TRP_ASK;              // no prefs yet → ask every login
     NSNumber *m = d[kMode];
-    return m ? m.integerValue : TRP_DISABLED;
+    return m ? m.integerValue : TRP_ASK;
 }
 
 static void cleanupPending(void) {
@@ -155,7 +157,7 @@ static void showBrowserPicker(NSURL *authURL) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *alert = [UIAlertController
             alertControllerWithTitle:@"选择登录方式"
-                             message:@"巨魔录音机的登录回调是 sileo://（属于 Sileo App）。第三方浏览器打开后无法把结果送回巨魔录音机，因此只能用 Safari。\n\n· Safari（默认）：共享 Safari Cookie\n· Safari（独立会话）：隔离 Cookie，可用于切换账号"
+                             message:@"巨魔录音机的登录回调是 sileo://（属于 Sileo App）。第三方浏览器打开后无法把结果送回巨魔录音机，因此只能用 Safari。\n\n· Safari（默认）：共享 Safari Cookie\n· Safari（独立会话）：隔离 Cookie，可用于切换账号\n\n不想每次都弹窗，可在 设置 → 巨魔录音机 浏览器选择 中关闭或固定模式。"
                       preferredStyle:UIAlertControllerStyleActionSheet];
 
         [alert addAction:[UIAlertAction actionWithTitle:@"Safari (默认)"
