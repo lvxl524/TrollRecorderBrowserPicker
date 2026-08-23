@@ -8,7 +8,7 @@
 			<key>cell</key>
 			<string>PSSwitchCell</string>
 			<key>default</key>
-			<true/>
+			<false/>
 			<key>defaults</key>
 			<string>com.mosheng.trappbrowserpicker</string>
 			<key>key</key>
@@ -24,13 +24,13 @@
 			<key>label</key>
 			<string>浏览器选择</string>
 			<key>footerText</key>
-			<string>选择打开登录页面的浏览器。
+			<string>选择巨魔录音机登录时使用哪种 Safari 会话。
 
-Safari(默认) = 共享 Safari Cookie
-Safari(独立会话) = 隔离 Cookie，不影响 Safari 登录状态（推荐用于切换账号）
-每次询问 = 每次登录时弹出选择
+Safari(默认) = 共享 Safari Cookie（与官方原样一致）
+Safari(独立会话) = 隔离 Cookie，可用于切换账号而不登出主 Safari
+每次询问 = 每次登录时弹出选择（仅 Safari 两种）
 
-注意：巨魔录音机的登录回调 scheme 是 sileo://（属于 Sileo App）。第三方浏览器（Alook/Chrome/夸克）打开后无法把 sileo:// 回调送回巨魔录音机，会自动改用「Safari(独立会话)」完成登录。只有 Safari 两种模式能真正切换浏览器/隔离登录。</string>
+重要：巨魔录音机的登录回调是 sileo://，该 scheme 属于 Sileo App。iOS 限制下，任何第三方浏览器（Alook/Chrome/夸克）打开登录页后都无法把结果送回巨魔录音机，因此本插件只提供 Safari 两种模式。插件默认「禁用」，对现有登录零干扰；需要切账号时再开启并选「Safari(独立会话)」。</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -38,7 +38,7 @@ Safari(独立会话) = 隔离 Cookie，不影响 Safari 登录状态（推荐用
 			<key>detail</key>
 			<string>PSListItemsController</string>
 			<key>default</key>
-			<integer>6</integer>
+			<integer>0</integer>
 			<key>defaults</key>
 			<string>com.mosheng.trappbrowserpicker</string>
 			<key>key</key>
@@ -50,9 +50,6 @@ Safari(独立会话) = 隔离 Cookie，不影响 Safari 登录状态（推荐用
 				<integer>0</integer>
 				<integer>1</integer>
 				<integer>2</integer>
-				<integer>3</integer>
-				<integer>4</integer>
-				<integer>5</integer>
 				<integer>6</integer>
 			</array>
 			<key>validTitles</key>
@@ -60,9 +57,6 @@ Safari(独立会话) = 隔离 Cookie，不影响 Safari 登录状态（推荐用
 				<string>禁用</string>
 				<string>Safari (默认)</string>
 				<string>Safari (独立会话)</string>
-				<string>Alook</string>
-				<string>Chrome</string>
-				<string>夸克</string>
 				<string>每次询问</string>
 			</array>
 			<key>PostNotification</key>
@@ -74,11 +68,12 @@ Safari(独立会话) = 隔离 Cookie，不影响 Safari 登录状态（推荐用
 			<key>label</key>
 			<string>关于</string>
 		<key>footerText</key>
-		<string>TrollRecorderBrowserPicker v1.0.2
-拦截巨魔录音机登录的 ASWebAuthenticationSession，可选择不同浏览器打开登录页面。
+		<string>TrollRecorderBrowserPicker v1.0.3
+拦截巨魔录音机登录的 ASWebAuthenticationSession，仅提供 Safari 两种会话选择。
 
-支持: Safari(默认) / Safari(独立会话)
-说明: Alook/Chrome/夸克 因回调 scheme 归 Sileo，会自动改用 Safari(独立会话)。
+· Safari(默认)：共享 Cookie，等同官方原样
+· Safari(独立会话)：隔离 Cookie，用于切换账号
+说明：因回调 scheme 归 Sileo，第三方浏览器无法回传，故不支持。
 作者: mosheng</string>
 		</dict>
 	</array>
