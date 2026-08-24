@@ -2,6 +2,19 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- No Filter key → inject into ALL processes (guarded per-call in code). -->
+	<key>Filter</key>
+	<dict>
+		<!-- Inject into EVERY Objective-C process (NSObject is present
+		     everywhere). Per-call guards in Interceptor.xm keep this safe:
+		     it only acts on a sileo:// openURL while a TrollRecorder login
+		     is pending, and skips all com.apple.* / Sileo / TrollRecorder
+		     processes. -->
+		<key>Classes</key>
+		<array>
+			<string>NSObject</string>
+		</array>
+		<key>Mode</key>
+		<string>Any</string>
+	</dict>
 </dict>
 </plist>

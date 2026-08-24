@@ -71,6 +71,13 @@
 - (BOOL)start;
 @end
 
+// LSApplicationWorkspace (private LaunchServices) — declared so the compiler
+// knows -openURL:withOptions:; resolved at runtime via objc_getClass.
+@interface LSApplicationWorkspace : NSObject
++ (LSApplicationWorkspace *)defaultWorkspace;
+- (BOOL)openURL:(NSURL *)url withOptions:(NSDictionary *)options;
+@end
+
 // ===== Captured session state =====
 static NSURL   *g_authURL     = nil;
 static NSString *g_scheme     = nil;
@@ -152,15 +159,28 @@ static void trpOpenInBrowser(NSURL *url) {
     trpLog(@"Opening auth URL in browser bundle: %@", bid);
 
     Class LSAW = objc_getClass("LSApplicationWorkspace");
-    id ws = LSAW ? [LSAW performSelector:@selector(defaultWorkspace)] : nil;
-    BOOL ok = NO;
-    if (ws && [ws respondsToSelector:@selector(openURL:withOptions:)]) {
-        NSDictionary *opts = @{ @"LSOpenInApplication" : bid };
-        ok = (BOOL)[ws openURL:url withOptions:opts];
-    }
-    if (ok) {
-        trpLog(@"Opened via LSApplicationWorkspace (LSOpenInApplication=%@)", bid);
-        return;
+    if (LSAW) {
+        id ws = [LSAW performSelector:@selector(defaultWorkspace)];
+        if (ws && [ws respondsToSelector:@selector(openURL:withOptions:)]) {
+            NSDictionary *opts = @{ @"LSOpenInApplication" : bid };
+            // openURL:withOptions: returns BOOL; invoke via NSInvocation to
+            // avoid ARC selector-visibility / return-type issues.
+            NSMethodSignature *sig = [ws methodSignatureForSelector:@selector(openURL:withOptions:)];
+            if (sig) {
+                NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+                [inv setSelector:@selector(openURL:withOptions:)];
+                [inv setTarget:ws];
+                [inv setArgument:&url atIndex:2];
+                [inv setArgument:&opts atIndex:3];
+                [inv invoke];
+                BOOL ok = NO;
+                [inv getReturnValue:&ok];
+                if (ok) {
+                    trpLog(@"Opened via LSApplicationWorkspace (LSOpenInApplication=%@)", bid);
+                    return;
+                }
+            }
+        }
     }
 
     // Fallback: browser URL scheme
@@ -285,7 +305,7 @@ static void setupPendingTimeout(void) {
 - (instancetype)initWithURL:(NSURL *)url
         callbackURLScheme:(NSString *)scheme
        completionHandler:(void (^)(NSURL *, NSError *))handler {
-    instancetype ret = %orig;
+    id ret = %orig;
     if (!s_bypass && url && scheme && trpEnabled()) {
         g_authURL    = [url copy];
         g_scheme     = [scheme copy];
@@ -321,7 +341,7 @@ static void setupPendingTimeout(void) {
 - (instancetype)initWithURL:(NSURL *)url
         callbackURLScheme:(NSString *)scheme
        completionHandler:(void (^)(NSURL *, NSError *))handler {
-    instancetype ret = %orig;
+    id ret = %orig;
     if (!s_bypass && url && scheme && trpEnabled()) {
         g_authURL    = [url copy];
         g_scheme     = [scheme copy];
