@@ -1,25 +1,37 @@
 //
 //  Tweak.xm
-//  TrollRecorderBrowserPicker
+//  TrollRecorderBrowserPicker  (TrollRecorder side)
 //
-//  Let the user choose how TrollRecorder's login (ASWebAuthenticationSession)
-//  opens — specifically to use an *isolated* Safari session so they can sign in
-//  with a different account without disturbing their main Safari login.
+//  v1.0.5 — Use a THIRD-PARTY browser (Alook/Chrome/Quark/custom) for
+//  TrollRecorder's Havoc login, and intercept the `sileo://` callback inside
+//  that browser, delivering it back to TrollRecorder. Safari is NEVER touched.
 //
-//  IMPORTANT — why only Safari works here:
-//  TrollRecorder's auth rides on the Havoc/Sileo payment service, whose callback
-//  scheme is `sileo://`. That scheme is *owned by the Sileo app*, not by
-//  TrollRecorder. A real third-party browser (Alook/Chrome/Quark) opens the login
-//  page, the server redirects to `sileo://…`, and iOS hands that scheme to Sileo —
-//  so the callback can never return to TrollRecorder. This is an iOS URL-scheme
-//  limitation and cannot be worked around. Therefore the ONLY viable choices are
-//  the two in-process Safari modes, which intercept `sileo://` internally and
-//  deliver it straight back to TrollRecorder.
+//  How it works (this is exactly what ASWebAuthenticationSession does, except
+//  the web page is rendered in the chosen third-party browser instead of
+//  Safari's shared session):
 //
-//  Design: Safari modes are 100% native pass-throughs (no state, no swizzle),
-//  so they behave exactly like stock TrollRecorder. The tweak only engages its
-//  machinery in "每次询问" (ask) mode, where it shows a picker offering the two
-//  Safari options.
+//   1. Hook ASWebAuthenticationSession / SFAuthenticationSession:
+//        - initWithURL:callbackURLScheme:completionHandler:  → capture the
+//          authURL, the callback scheme (`sileo`) and the completionHandler.
+//        - start  → DON'T start the real Safari session. Instead set a "pending"
+//          flag (a file) and open the authURL in the chosen third-party browser
+//          via LSApplicationWorkspace `openURL:withOptions:` with the
+//          `LSOpenInApplication` key (falls back to the browser's URL scheme).
+//
+//   2. The browser renders the Havoc login page using ITS OWN cookies (so the
+//      user logs in with the browser's account, not Safari's).
+//
+//   3. On success Havoc redirects to `sileo://…`. The *global* interceptor
+//      dylib (TRPInterceptor) catches that `sileo://` openURL inside the
+//      browser, writes the full URL to a file and posts a cross-process
+//      Darwin notification.
+//
+//   4. This dylib (running inside TrollRecorder) observes that notification,
+//      reads the URL and calls the captured completionHandler with it — exactly
+//      as if ASWebAuthenticationSession had intercepted the callback in-process.
+//
+//  Safari is completely untouched: we never read or write its cookies, and the
+//  only thing we open in the browser is the Havoc login URL.
 //
 
 #import <UIKit/UIKit.h>
@@ -27,18 +39,25 @@
 #import <objc/runtime.h>
 
 // ===== Version =====
-#define TRP_VERSION @"1.0.4"
+#define TRP_VERSION @"1.0.5"
 
 // ===== Preferences =====
 #define PREFS_PATH @"/var/mobile/Library/Preferences/com.mosheng.trappbrowserpicker.plist"
-#define kEnabled   @"enabled"
-#define kMode      @"browserMode"
+#define kEnabled      @"enabled"
+#define kBrowserMode  @"browserMode"
+#define kCustomBundle @"customBundleId"
 
 // Browser modes
-#define TRP_DISABLED           0
-#define TRP_SAFARI_DEFAULT     1
-#define TRP_SAFARI_EPHEMERAL   2
-#define TRP_ASK                6
+#define TRP_BROWSER_ALOOK   0
+#define TRP_BROWSER_CHROME  1
+#define TRP_BROWSER_QUARK   2
+#define TRP_BROWSER_CUSTOM  3
+
+// ===== Cross-process handshake files =====
+#define TRP_PENDING_PATH @"/var/mobile/Library/Preferences/com.mosheng.trappbrowserpicker.pending"
+#define TRP_RESULT_PATH  @"/var/mobile/Library/Preferences/com.mosheng.trappbrowserpicker.auth"
+#define TRP_LOG_PATH     @"/var/mobile/Library/Preferences/com.mosheng.trappbrowserpicker.log"
+#define TRP_NOTIFY_NAME  CFSTR("com.mosheng.trappbrowserpicker.auth")
 
 // ASWebAuthenticationSessionError.canceledLogin = 10
 #define TRP_CANCEL_CODE 10
@@ -50,222 +69,300 @@
         callbackURLScheme:(NSString *)callbackURLScheme
        completionHandler:(void (^)(NSURL *, NSError *))completionHandler;
 - (BOOL)start;
-@property (nonatomic) BOOL prefersEphemeralWebBrowserSession;
 @end
 
-// ===== Pending auth state (only used in "每次询问" mode) =====
-static NSURL   *s_pendingURL    = nil;
-static void (^s_pendingHandler)(NSURL *, NSError *) = nil;
-static ASWebAuthenticationSession *s_pendingSession = nil;
-static BOOL    s_hasPending     = NO;
+// ===== Captured session state =====
+static NSURL   *g_authURL     = nil;
+static NSString *g_scheme     = nil;
+static void (^g_completion)(NSURL *, NSError *) = nil;
+static BOOL    s_bypass       = NO;   // internal re-entry guard
+static BOOL    s_delivered    = NO;   // already delivered a result?
+static CFAbsoluteTime g_startTime = 0;
 
-// Bypass flag: lets us re-start the ORIGINAL session from the picker without
-// re-triggering our own start hook.
-static BOOL s_bypassHook = NO;
+// ===== Logging (shared with the interceptor dylib) =====
+static void trpLog(NSString *fmt, ...) {
+    va_list args; va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [NSDate date], msg];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:TRP_LOG_PATH];
+    if (fh) {
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } else {
+        [line writeToFile:TRP_LOG_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+}
 
-// ===== Auto-cancel observer handle =====
-static id s_activeObserver = nil;
-
-// ===== Helpers =====
-
+// ===== Preference helpers =====
 static BOOL trpEnabled(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:PREFS_PATH];
-    if (!d) return YES;                  // no prefs yet → engage by default (show picker)
+    if (!d) return YES;                  // no prefs yet → engage by default
     NSNumber *en = d[kEnabled];
     return en ? en.boolValue : YES;      // default ON
 }
 
-static NSInteger trpMode(void) {
+static NSInteger trpBrowserMode(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:PREFS_PATH];
-    if (!d) return TRP_ASK;              // no prefs yet → ask every login
-    NSNumber *m = d[kMode];
-    return m ? m.integerValue : TRP_ASK;
+    if (!d) return TRP_BROWSER_ALOOK;
+    NSNumber *m = d[kBrowserMode];
+    return m ? m.integerValue : TRP_BROWSER_ALOOK;
 }
 
-static void cleanupPending(void) {
-    s_pendingURL    = nil;
-    s_pendingHandler = nil;
-    s_pendingSession = nil;
-    s_hasPending    = NO;
-    if (s_activeObserver) {
-        [[NSNotificationCenter defaultCenter] removeObserver:s_activeObserver];
-        s_activeObserver = nil;
-    }
-}
-
-static void cancelPendingAuth(void) {
-    if (!s_hasPending) return;
-    void (^handler)(NSURL *, NSError *) = s_pendingHandler;
-    cleanupPending();
-    NSError *err = [NSError errorWithDomain:TRP_ERROR_DOMAIN
-                                        code:TRP_CANCEL_CODE
-                                    userInfo:nil];
-    handler(nil, err);
-}
-
-// Get the active window (iOS 13+ UIScene compatible)
-static UIWindow *trpActiveWindow(void) {
-    for (UIScene *scene in [UIApplication.sharedApplication connectedScenes]) {
-        if (scene.activationState == UISceneActivationStateForegroundActive) {
-            if ([scene isKindOfClass:[UIWindowScene class]]) {
-                UIWindowScene *ws = (UIWindowScene *)scene;
-                for (UIWindow *w in ws.windows) {
-                    if (w.isKeyWindow) return w;
-                }
-                if (ws.windows.count > 0) return ws.windows.firstObject;
-            }
+static NSString *trpBrowserBundleId(void) {
+    switch (trpBrowserMode()) {
+        case TRP_BROWSER_CHROME:  return @"com.google.chrome.ios";
+        case TRP_BROWSER_QUARK:   return @"com.quark.browser";
+        case TRP_BROWSER_CUSTOM: {
+            NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:PREFS_PATH];
+            NSString *c = d ? d[kCustomBundle] : nil;
+            return (c && c.length > 0) ? c : @"com.ld.TakeBrowser";
         }
-    }
-    return nil;
-}
-
-// Present a view controller safely
-static void trpPresent(UIAlertController *alert) {
-    UIWindow *win = trpActiveWindow();
-    if (!win) {
-        win = [[UIWindow alloc] initWithFrame:[UIScreen.mainScreen bounds]];
-        win.windowLevel = UIWindowLevelAlert;
-        [win makeKeyAndVisible];
-    }
-    UIViewController *vc = win.rootViewController;
-    if (!vc) {
-        vc = [[UIViewController alloc] init];
-        win.rootViewController = vc;
-    }
-    while (vc.presentedViewController) {
-        vc = vc.presentedViewController;
-    }
-    [vc presentViewController:alert animated:YES completion:nil];
-}
-
-// Start TrollRecorder's ORIGINAL session with the chosen ephemeral flag.
-// Reusing the original session object (which already has its
-// presentationContextProvider configured by the app) avoids the
-// presentationContextInvalid (error 2) that a freshly allocated session would hit.
-static void trpStartNative(BOOL ephemeral) {
-    if (s_hasPending && s_pendingSession && s_pendingHandler) {
-        s_bypassHook = YES;
-        s_pendingSession.prefersEphemeralWebBrowserSession = ephemeral;
-        [s_pendingSession start];
-        s_bypassHook = NO;
-        cleanupPending();
+        case TRP_BROWSER_ALOOK:
+        default: return @"com.ld.TakeBrowser";
     }
 }
 
-// Show browser picker action sheet (only Safari options are viable — see header)
-static void showBrowserPicker(NSURL *authURL) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *alert = [UIAlertController
-            alertControllerWithTitle:@"选择登录方式"
-                             message:@"巨魔录音机的登录回调是 sileo://（属于 Sileo App）。第三方浏览器打开后无法把结果送回巨魔录音机，因此只能用 Safari。\n\n· Safari（默认）：共享 Safari Cookie\n· Safari（独立会话）：隔离 Cookie，可用于切换账号\n\n不想每次都弹窗，可在 设置 → 巨魔录音机 浏览器选择 中关闭或固定模式。"
-                      preferredStyle:UIAlertControllerStyleActionSheet];
-
-        [alert addAction:[UIAlertAction actionWithTitle:@"Safari (默认)"
-                                                   style:UIAlertActionStyleDefault
-                                                 handler:^(UIAlertAction *a) {
-            trpStartNative(NO);
-        }]];
-
-        [alert addAction:[UIAlertAction actionWithTitle:@"Safari (独立会话)"
-                                                   style:UIAlertActionStyleDefault
-                                                 handler:^(UIAlertAction *a) {
-            trpStartNative(YES);
-        }]];
-
-        [alert addAction:[UIAlertAction actionWithTitle:@"取消"
-                                                   style:UIAlertActionStyleCancel
-                                                 handler:^(UIAlertAction *a) {
-            cancelPendingAuth();
-        }]];
-
-        trpPresent(alert);
-    });
+// Build a URL that opens `url` inside the chosen browser using its URL scheme
+// (used only as a fallback when LSApplicationWorkspace is unavailable).
+static NSString *trpBrowserSchemeURL(NSURL *url) {
+    NSString *abs = url.absoluteString;
+    switch (trpBrowserMode()) {
+        case TRP_BROWSER_CHROME: {
+            NSString *stripped = abs;
+            if ([stripped hasPrefix:@"https://"]) stripped = [stripped substringFromIndex:8];
+            else if ([stripped hasPrefix:@"http://"]) stripped = [stripped substringFromIndex:7];
+            return [@"googlechrome://" stringByAppendingString:stripped];
+        }
+        case TRP_BROWSER_QUARK:
+            return [@"quark://" stringByAppendingString:abs];
+        case TRP_BROWSER_CUSTOM:
+            // Unknown scheme for custom apps; caller falls back to LSApplicationWorkspace only.
+            return abs;
+        case TRP_BROWSER_ALOOK:
+        default:
+            return [@"Alook://" stringByAppendingString:abs];
+    }
 }
 
-// Setup auto-cancel: if the user returns to the app without completing auth,
-// cancel after a grace period so we don't leave a dangling pending session.
-static void setupAutoCancel(void) {
-    if (s_activeObserver) {
-        [[NSNotificationCenter defaultCenter] removeObserver:s_activeObserver];
-        s_activeObserver = nil;
+// Open `url` in the chosen third-party browser.
+static void trpOpenInBrowser(NSURL *url) {
+    NSString *bid = trpBrowserBundleId();
+    trpLog(@"Opening auth URL in browser bundle: %@", bid);
+
+    Class LSAW = objc_getClass("LSApplicationWorkspace");
+    id ws = LSAW ? [LSAW performSelector:@selector(defaultWorkspace)] : nil;
+    BOOL ok = NO;
+    if (ws && [ws respondsToSelector:@selector(openURL:withOptions:)]) {
+        NSDictionary *opts = @{ @"LSOpenInApplication" : bid };
+        ok = (BOOL)[ws openURL:url withOptions:opts];
     }
-    s_activeObserver = [[NSNotificationCenter defaultCenter]
+    if (ok) {
+        trpLog(@"Opened via LSApplicationWorkspace (LSOpenInApplication=%@)", bid);
+        return;
+    }
+
+    // Fallback: browser URL scheme
+    NSString *schemeURL = trpBrowserSchemeURL(url);
+    NSURL *su = [NSURL URLWithString:schemeURL];
+    if (su) {
+        trpLog(@"Fallback scheme open: %@", schemeURL);
+        [[UIApplication sharedApplication] openURL:su options:@{} completionHandler:nil];
+    } else {
+        trpLog(@"FAILED to open auth URL in browser (no LSAW, bad scheme)");
+    }
+}
+
+static void trpSetPending(void) {
+    [@"1" writeToFile:TRP_PENDING_PATH atomically:YES
+             encoding:NSUTF8StringEncoding error:nil];
+}
+static void trpClearPending(void) {
+    [[NSFileManager defaultManager] removeItemAtPath:TRP_PENDING_PATH error:nil];
+}
+static void trpClearResult(void) {
+    [[NSFileManager defaultManager] removeItemAtPath:TRP_RESULT_PATH error:nil];
+}
+
+// Deliver the captured `sileo://` URL to TrollRecorder's completionHandler.
+static void trpDeliver(NSURL *callbackURL) {
+    void (^h)(NSURL *, NSError *) = g_completion;
+    g_completion = nil;
+    g_authURL = nil;
+    g_scheme = nil;
+    s_delivered = YES;
+    trpClearPending();
+    trpClearResult();
+    if (h) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            trpLog(@"Calling completionHandler with callback URL");
+            h(callbackURL, nil);
+        });
+    }
+}
+
+static void trpCancel(void) {
+    if (s_delivered) return;
+    void (^h)(NSURL *, NSError *) = g_completion;
+    g_completion = nil;
+    g_authURL = nil;
+    g_scheme = nil;
+    s_delivered = YES;
+    trpClearPending();
+    trpClearResult();
+    if (h) {
+        NSError *err = [NSError errorWithDomain:TRP_ERROR_DOMAIN
+                                            code:TRP_CANCEL_CODE
+                                        userInfo:nil];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            trpLog(@"Cancelling pending auth");
+            h(nil, err);
+        });
+    }
+}
+
+// ===== Darwin notification callback (fired by the interceptor dylib) =====
+static void trpAuthNotifyCallback(CFNotificationCenterRef center,
+                                  void *observer,
+                                  CFStringRef name,
+                                  const void *object,
+                                  CFDictionaryRef userInfo) {
+    @autoreleasepool {
+        if (s_delivered) return;
+        NSString *s = [NSString stringWithContentsOfFile:TRP_RESULT_PATH
+                                                encoding:NSUTF8StringEncoding
+                                                   error:nil];
+        if (!s || s.length == 0) {
+            trpLog(@"Auth notification but empty result file");
+            return;
+        }
+        s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSURL *cb = [NSURL URLWithString:s];
+        trpLog(@"Received auth callback: %@", s);
+        trpDeliver(cb);
+    }
+}
+
+// Cancel if the user returns to TrollRecorder without completing (mimics the
+// native "user cancelled" path so the app stays usable).
+static void setupCancelOnReturn(void) {
+    [[NSNotificationCenter defaultCenter]
         addObserverForName:UIApplicationDidBecomeActiveNotification
                     object:nil
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *note) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (s_hasPending) cancelPendingAuth();
-        });
+        if (s_delivered) return;
+        if (!g_completion) return;
+        if (![[NSFileManager defaultManager] fileExistsAtPath:TRP_PENDING_PATH]) return;
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - g_startTime > 20.0) {
+            trpLog(@"Returned to app without auth result → cancel");
+            trpCancel();
+        }
     }];
 }
 
-// ===== Hooks =====
+// Safety net: clear the pending flag after 10 minutes so a forgotten/stale
+// login can never make us steal a later legitimate `sileo://` (e.g. Sileo's
+// own login). If a result arrives after this, it simply won't be delivered
+// (acceptable edge case).
+static void setupPendingTimeout(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * 60 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!s_delivered && g_completion) {
+            trpLog(@"Pending flag timeout (10 min) → cancelling");
+            trpCancel();
+        }
+    });
+}
 
-%group ASWebAuthHooks
+// ===== Hooks =====
+%group TRPHooks
 
 %hook ASWebAuthenticationSession
 
 - (instancetype)initWithURL:(NSURL *)url
         callbackURLScheme:(NSString *)scheme
        completionHandler:(void (^)(NSURL *, NSError *))handler {
-    ASWebAuthenticationSession *ret = %orig;
-
-    // Only capture state when we will actually intercept (ask mode). For every
-    // other mode we leave the session completely untouched → native behavior.
-    if (!s_bypassHook && url && scheme && trpEnabled() && trpMode() == TRP_ASK) {
-        s_pendingURL     = [url copy];
-        s_pendingHandler = [handler copy];
-        s_pendingSession = ret;
-        s_hasPending     = YES;
+    instancetype ret = %orig;
+    if (!s_bypass && url && scheme && trpEnabled()) {
+        g_authURL    = [url copy];
+        g_scheme     = [scheme copy];
+        g_completion = [handler copy];
+        s_delivered  = NO;
+        g_startTime  = CFAbsoluteTimeGetCurrent();
+        trpLog(@"Captured ASWebAuthenticationSession url=%@ scheme=%@", url, scheme);
     }
-
     return ret;
 }
 
 - (BOOL)start {
-    // Bypass: internal re-start from the picker (uses the original session).
-    if (s_bypassHook) {
-        return %orig;
-    }
+    if (s_bypass) return %orig;
+    if (!trpEnabled() || !g_completion || s_delivered) return %orig;
 
-    // Disabled or plugin off → fully native.
-    if (!s_hasPending || !trpEnabled()) {
-        return %orig;
-    }
-
-    NSInteger mode = trpMode();
-
-    switch (mode) {
-        case TRP_DISABLED:
-        case TRP_SAFARI_DEFAULT:
-            // Pure native — same as stock TrollRecorder.
-            return %orig;
-
-        case TRP_SAFARI_EPHEMERAL:
-            // Native, but with an isolated (ephemeral) cookie jar. This is what
-            // lets the user sign in with a different account without disturbing
-            // their main Safari login.
-            self.prefersEphemeralWebBrowserSession = YES;
-            return %orig;
-
-        case TRP_ASK:
-        default:
-            // Show picker; the chosen Safari option starts the original session.
-            showBrowserPicker(s_pendingURL);
-            setupAutoCancel();
-            return YES;  // Pretend session started
-    }
+    trpSetPending();
+    g_startTime = CFAbsoluteTimeGetCurrent();
+    NSURL *url = g_authURL;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (url) trpOpenInBrowser(url);
+    });
+    setupCancelOnReturn();
+    setupPendingTimeout();
+    trpLog(@"start: deferred to third-party browser (mode=%ld)", (long)trpBrowserMode());
+    return YES;  // pretend the session started
 }
 
 %end // %hook ASWebAuthenticationSession
 
-%end // %group ASWebAuthHooks
+// Older API, identical shape.
+%hook SFAuthenticationSession
+
+- (instancetype)initWithURL:(NSURL *)url
+        callbackURLScheme:(NSString *)scheme
+       completionHandler:(void (^)(NSURL *, NSError *))handler {
+    instancetype ret = %orig;
+    if (!s_bypass && url && scheme && trpEnabled()) {
+        g_authURL    = [url copy];
+        g_scheme     = [scheme copy];
+        g_completion = [handler copy];
+        s_delivered  = NO;
+        g_startTime  = CFAbsoluteTimeGetCurrent();
+        trpLog(@"Captured SFAuthenticationSession url=%@ scheme=%@", url, scheme);
+    }
+    return ret;
+}
+
+- (BOOL)start {
+    if (s_bypass) return %orig;
+    if (!trpEnabled() || !g_completion || s_delivered) return %orig;
+
+    trpSetPending();
+    g_startTime = CFAbsoluteTimeGetCurrent();
+    NSURL *url = g_authURL;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (url) trpOpenInBrowser(url);
+    });
+    setupCancelOnReturn();
+    setupPendingTimeout();
+    trpLog(@"SF start: deferred to third-party browser (mode=%ld)", (long)trpBrowserMode());
+    return YES;
+}
+
+%end // %hook SFAuthenticationSession
+
+%end // %group TRPHooks
 
 // ===== Constructor =====
 %ctor {
-    %init(ASWebAuthHooks);
-    NSLog(@"[TrollRecorderBrowserPicker] v%@ loaded (enabled=%d mode=%ld)",
-          TRP_VERSION, trpEnabled(), (long)trpMode());
+    %init(TRPHooks);
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        NULL,
+        trpAuthNotifyCallback,
+        TRP_NOTIFY_NAME,
+        NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately);
+    trpLog(@"[TrollRecorderBrowserPicker] v%@ loaded (enabled=%d mode=%ld)",
+           TRP_VERSION, trpEnabled(), (long)trpBrowserMode());
 }
